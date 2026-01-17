@@ -1,5 +1,5 @@
 
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useMemo } from 'react';
 import RouletteWheel from './components/RouletteWheel';
 import Controls from './components/Controls';
 import ResultModal from './components/ResultModal';
@@ -14,13 +14,19 @@ const App: React.FC = () => {
   const [rotation, setRotation] = useState(0);
   const [spinResult, setSpinResult] = useState<SpinResult | null>(null);
   const [winProbability, setWinProbability] = useState(33); 
+  const [avgDiscountLimit, setAvgDiscountLimit] = useState(20); // Лимит средней скидки
+  const [spinHistory, setSpinHistory] = useState<number[]>([]); // История скидок (0 для проигрыша)
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   
   const currentRotationRef = useRef(0);
 
-  /**
-   * Функция проверки выигрыша сектора относительно ставки.
-   */
+  // Расчет текущей средней скидки за последние 100 спинов
+  const currentAverage = useMemo(() => {
+    if (spinHistory.length === 0) return 0;
+    const sum = spinHistory.reduce((a, b) => a + b, 0);
+    return parseFloat((sum / spinHistory.length).toFixed(1));
+  }, [spinHistory]);
+
   const checkIsWinningSector = (bet: BetType, sector: typeof FULL_ROULETTE[0]) => {
     if (bet === BetType.RED) return sector.color === 'red';
     if (bet === BetType.BLACK) return sector.color === 'black';
@@ -31,35 +37,57 @@ const App: React.FC = () => {
   const handleSpin = useCallback(() => {
     if (isSpinning || !selectedBet) return;
 
-    // Фиксируем текущие настройки в локальных переменных, чтобы они не изменились во время анимации
     const currentBet = selectedBet;
     const currentProb = winProbability;
+    const currentLimit = avgDiscountLimit;
 
     setIsSpinning(true);
     setSpinResult(null);
 
-    // 1. Решаем исход: победа или поражение
-    const shouldWin = (Math.random() * 100) < currentProb;
+    // 1. Предварительный расчет "шанса на победу"
+    const randomWinTrigger = (Math.random() * 100) < currentProb;
     
-    // 2. Отбираем сектора, которые подходят под решение
-    const eligibleSectors = FULL_ROULETTE.filter(sector => {
+    // 2. ФИЛЬТРАЦИЯ ПО ЛИМИТУ СРЕДНЕЙ СКИДКИ
+    // Мы должны найти такие сектора, которые не выведут среднее за пределы лимита
+    const historySum = spinHistory.reduce((a, b) => a + b, 0);
+    const historyCount = spinHistory.length;
+    // Если история заполнена (100), убираем самый старый элемент для расчета будущего среднего
+    const compensation = historyCount >= 100 ? spinHistory[0] : 0;
+
+    const safeWinningSectors = FULL_ROULETTE.filter(sector => {
       const isMatch = checkIsWinningSector(currentBet, sector);
-      return shouldWin ? isMatch : !isMatch;
+      if (!isMatch) return false;
+
+      // Оцениваем "стоимость" сектора. Зеро считаем как 99% скидку для мат. модели
+      const discountValue = (sector.number === 0 && sector.color === 'green') ? 99 : sector.number;
+      
+      const projectedSum = historySum + discountValue - compensation;
+      const projectedAvg = projectedSum / Math.min(historyCount + 1, 100);
+      
+      return projectedAvg <= currentLimit;
     });
 
-    // 3. Выбираем конкретный сектор из списка разрешенных
-    const winningItem = eligibleSectors[Math.floor(Math.random() * eligibleSectors.length)];
-    const winningIndex = FULL_ROULETTE.findIndex(item => item.number === winningItem.number);
+    // 3. Финальное решение о победе
+    // Игрок выигрывает только если: 
+    // а) Рандом разрешил 
+    // б) Есть хотя бы один сектор, не нарушающий финансовый лимит
+    const canActuallyWin = randomWinTrigger && safeWinningSectors.length > 0;
+    
+    const eligibleSectors = canActuallyWin 
+      ? safeWinningSectors 
+      : FULL_ROULETTE.filter(s => !checkIsWinningSector(currentBet, s));
 
-    // 4. Расчет угла вращения
+    const winningItem = eligibleSectors[Math.floor(Math.random() * eligibleSectors.length)];
+    
+    // 4. Расчет физики вращения
     const baseRotation = Math.ceil(currentRotationRef.current / 360) * 360;
-    const extraRevolutions = (MIN_REVOLUTIONS + Math.floor(Math.random() * 3)) * 360;
+    const extraRevolutions = (MIN_REVOLUTIONS + Math.floor(Math.random() * 2)) * 360;
     const targetRotation = baseRotation + extraRevolutions + (360 - winningItem.angle);
     
     setRotation(targetRotation);
     currentRotationRef.current = targetRotation;
 
-    // 5. Звук (тики)
+    // 5. Тики звука
     let tickCount = 0;
     const totalSectors = (targetRotation - (currentRotationRef.current - extraRevolutions - (360 - winningItem.angle))) / (360 / 37);
     const startTime = Date.now();
@@ -78,12 +106,17 @@ const App: React.FC = () => {
     };
     playTicks();
 
-    // 6. Завершение анимации
+    // 6. Завершение
     setTimeout(() => {
       setIsSpinning(false);
-      
-      // Итоговая сверка
       const finalIsWin = checkIsWinningSector(currentBet, winningItem);
+      
+      // Добавляем результат в историю (лимит 100 записей)
+      const discountForHistory = finalIsWin ? (winningItem.number === 0 ? 99 : winningItem.number) : 0;
+      setSpinHistory(prev => {
+        const next = [...prev, discountForHistory];
+        return next.length > 100 ? next.slice(1) : next;
+      });
 
       setSpinResult({
         number: winningItem.number,
@@ -98,7 +131,7 @@ const App: React.FC = () => {
       }
     }, SPIN_DURATION);
 
-  }, [isSpinning, selectedBet, winProbability]);
+  }, [isSpinning, selectedBet, winProbability, avgDiscountLimit, spinHistory]);
 
   const handleCloseModal = () => {
     setSpinResult(null);
@@ -106,7 +139,6 @@ const App: React.FC = () => {
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-6 md:p-12 relative overflow-hidden bg-[#064e3b]">
-      {/* Кнопка настроек */}
       <button 
         onClick={() => !isSpinning && setIsSettingsOpen(true)}
         disabled={isSpinning}
@@ -127,7 +159,6 @@ const App: React.FC = () => {
           <h1 className="text-5xl md:text-7xl font-bold text-yellow-500 drop-shadow-[0_4px_10px_rgba(0,0,0,0.5)] mb-2 tracking-tighter uppercase">
             Рулетка Скидок
           </h1>
-          {/* Надпись удалена по запросу пользователя */}
         </header>
 
         <main className="w-full flex flex-col items-center gap-8">
@@ -142,7 +173,7 @@ const App: React.FC = () => {
         </main>
 
         <footer className="mt-12 text-emerald-400/30 text-[9px] uppercase tracking-[0.4em] font-bold text-center">
-          Система верифицирована • Точность 100%<br/>
+          Система верифицирована • Контроль бюджета активен<br/>
           Casino Interactive Studio • 2025
         </footer>
       </div>
@@ -154,6 +185,10 @@ const App: React.FC = () => {
         onClose={() => setIsSettingsOpen(false)}
         winProbability={winProbability}
         setWinProbability={setWinProbability}
+        avgDiscountLimit={avgDiscountLimit}
+        setAvgDiscountLimit={setAvgDiscountLimit}
+        currentAverage={currentAverage}
+        historyCount={spinHistory.length}
       />
     </div>
   );
